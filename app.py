@@ -32,7 +32,7 @@ st.set_page_config(page_title="Kopi & Crumb - Survey Analytics", page_icon="☕"
 DATA_FILE = "kopi_crumb_survey_5000.csv"
 COFFEE = ["#6F4E37", "#C8A27C", "#2E7D6B", "#D9822B", "#8C6BB1", "#4C78A8", "#B5B5B5", "#A0522D"]
 GOOD, WARN, BAD = "#2E7D32", "#E09A1A", "#C62828"
-px.defaults.template = "plotly_white"
+px.defaults.template = "none"  # Streamlit styles the charts itself; this also avoids a Plotly template error on some servers
 px.defaults.color_discrete_sequence = COFFEE
 
 # --------------------------------------------------------------------------------------
