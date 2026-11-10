@@ -15,16 +15,21 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from mlxtend.frequent_patterns import apriori, association_rules
+from scipy.stats import chi2_contingency
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.ensemble import (GradientBoostingClassifier, RandomForestClassifier,
-                              RandomForestRegressor)
-from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score, mean_absolute_error,
+from sklearn.ensemble import (GradientBoostingClassifier, HistGradientBoostingClassifier, HistGradientBoostingRegressor,
+                              RandomForestClassifier, RandomForestRegressor, VotingClassifier)
+from sklearn.linear_model import Lasso, LinearRegression, LogisticRegression, Ridge
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVC
+from sklearn.metrics import (accuracy_score, calinski_harabasz_score, confusion_matrix, davies_bouldin_score, f1_score, mean_absolute_error,
                              mean_squared_error, precision_score, r2_score, recall_score,
                              roc_auc_score, roc_curve, silhouette_score)
 from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.tree import DecisionTreeClassifier
 
 st.set_page_config(page_title="Kopi & Crumb - Survey Analytics", page_icon="☕", layout="wide")
@@ -89,6 +94,25 @@ RATING_COLS = ["Q12a_imp_freshness", "Q12b_imp_price", "Q12c_imp_authentic_taste
 REQUIRED = ["Q1_age_group", "Q4_household_income_aed_month", "Q7_cafe_visit_frequency", "Q8_spend_per_visit_aed",
             "Q11_kopi_experience", "Q14_visit_intent", "Q18_expected_monthly_spend_aed", "Q21_expected_visits_per_month"] \
     + RATING_COLS + list(PRODUCTS)
+
+
+# --------------------------------------------------------------------------------------
+# Model optimisation results (tune_v2.py + tune_v2_finish.py, run offline).
+# Protocol: stratified 75/25 split made before tuning; every configuration scored by 5-fold CV on the training
+# data only, with scaling and feature selection inside the pipeline; finalists re-ranked by repeated CV (5 x 3);
+# the 25% test set is used once. Too slow to repeat live, so the results are stored here.
+# --------------------------------------------------------------------------------------
+TUNING = pd.DataFrame([('Logistic Regression', 'Exhaustive grid', 840, 4200, 'standard scaling, best 30 features, C=0.01, L1 share 0.25', 0.7342, 0.7431, 0.7379, 0.7392), ('Decision Tree', 'Exhaustive grid', 288, 1440, 'entropy, depth 6, min leaf 30, balanced classes', 0.6235, 0.7048, 0.7005, 0.63), ('K-Nearest Neighbours', 'Exhaustive grid', 432, 2160, 'min-max scaling, best 10 features, k=71, Euclidean', 0.62, 0.7271, 0.7315, 0.6275), ('Support Vector Machine', 'Exhaustive grid', 46, 230, 'standard scaling, best 20 features, linear kernel, C=1', 0.7162, 0.7363, 0.7369, 0.7188), ('Hist Gradient Boosting', 'Exhaustive grid', 324, 1620, 'learning rate 0.02, 400 iterations, depth 3, min leaf 20, L2=1', 0.7073, 0.7347, 0.73, 0.7294), ('Random Forest', 'Randomised (50 of 2160)', 50, 250, '500 trees, depth 8, sqrt features, min leaf 10', 0.7179, 0.7287, 0.7254, 0.7498), ('Gradient Boosting', 'Randomised (40 of 864)', 40, 200, '200 trees, learning rate 0.05, depth 2, min leaf 10, sqrt features', 0.7282, 0.7334, 0.733, 0.7416), ('Soft-Voting Ensemble', 'Ensemble of top 3', 1, 5, 'average of tuned LR, HGB and GB', None, 0.7347, 0.7333, None), ('Stacking Ensemble', 'Ensemble of top 3', 1, 5, 'LR on top of tuned LR, HGB and GB', None, 0.7377, 0.7367, None)], columns=["Model", "Search", "Configurations", "Fits", "Selected settings", "CV accuracy (default)",
+                                        "CV accuracy (tuned)", "Repeated CV accuracy", "Test accuracy (default)"])
+TUNING_TOTAL = {"configurations": 2022, "fits": 10110}
+SELECTED_MODEL = "Logistic Regression"   # highest repeated-CV accuracy, and the simplest model
+ACCURACY_CEILING = 0.806   # test-set accuracy of an oracle that knows every hidden trait used to simulate the data
+REG_TUNING = pd.DataFrame([('Linear Regression', 1, 5, '-', 0.4461, 0.4482, 0.4642), ('Ridge', 8, 40, 'alpha=300', 0.4461, 0.4491, 0.4631), ('Lasso', 8, 40, 'alpha=3', 0.4466, 0.455, 0.4591), ('Elastic Net', 18, 90, 'alpha=0.3, l1_ratio=0.8', 0.426, 0.4505, 0.4634), ('K-Nearest Neighbours', 12, 60, 'n_neighbors=20, weights=distance', 0.2952, 0.3782, 1.0), ('Random Forest', 60, 300, 'max_depth=12, max_features=0.5, min_samples_leaf=8', 0.5847, 0.5781, 0.7086), ('Hist Gradient Boosting', 81, 405, 'learning_rate=0.05, max_depth=3, max_iter=100, min_samples_leaf=100', 0.5686, 0.5713, 0.6212)], columns=["Model", "Configurations", "Fits", "Selected settings", "Test R² (default)",
+                                            "CV R² (tuned)", "Training R² (tuned)"])
+REG_TOTAL = {"configurations": 188, "fits": 940}
+CLUSTER_SEARCH = 126          # 3 scalers x 6 algorithms x k = 2..8
+RULE_THRESHOLDS_TESTED = 100  # support x confidence x lift grid, validated on unseen baskets
+BEST_THRESHOLD = 0.50
 
 
 def pct(x, d=1):
@@ -218,41 +242,72 @@ NICE = {"cafe_frequency": "Cafe visit frequency", "spend_per_visit": "Spend per 
 # --------------------------------------------------------------------------------------
 # 2. Classification
 # --------------------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Training classification models...")
+def tuned_classifiers():
+    """Each model with the settings selected by the optimisation search."""
+    def P(scaler, k, model):
+        return Pipeline([("scale", scaler), ("select", SelectKBest(f_classif, k=k)), ("m", model)])
+    lr = lambda: P(StandardScaler(), 30, LogisticRegression(solver="saga", C=0.01, l1_ratio=0.25, max_iter=3000))
+    hgb = lambda: HistGradientBoostingClassifier(learning_rate=0.02, max_iter=400, max_depth=3, min_samples_leaf=20,
+                                                 l2_regularization=1.0, random_state=42)
+    gb = lambda: GradientBoostingClassifier(n_estimators=200, learning_rate=0.05, max_depth=2, min_samples_leaf=10,
+                                            max_features="sqrt", subsample=1.0, random_state=42)
+    return {
+        "Logistic Regression": lr,
+        "Decision Tree": lambda: DecisionTreeClassifier(criterion="entropy", max_depth=6, min_samples_leaf=30,
+                                                        class_weight="balanced", random_state=42),
+        "K-Nearest Neighbours": lambda: P(MinMaxScaler(), 10, KNeighborsClassifier(n_neighbors=71, p=2)),
+        "Support Vector Machine": lambda: P(StandardScaler(), 20, SVC(kernel="linear", C=1)),
+        "Hist Gradient Boosting": hgb,
+        "Random Forest": lambda: RandomForestClassifier(n_estimators=500, max_depth=8, max_features="sqrt", min_samples_leaf=10,
+                                                        random_state=42, n_jobs=-1),
+        "Gradient Boosting": gb,
+        "Soft-Voting Ensemble": lambda: VotingClassifier([("lr", lr()), ("hgb", hgb()), ("gb", gb())], voting="soft"),
+    }
+
+
+def _score(m, X):
+    return m.predict_proba(X)[:, 1] if hasattr(m, "predict_proba") else m.decision_function(X)
+
+
+@st.cache_resource(show_spinner="Training the tuned classification models...")
 def run_classification(df: pd.DataFrame):
     X = encode(df)
     y = df["interested"]
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, stratify=y, random_state=42)
-    sc = StandardScaler().fit(Xtr)
-    makers = {
-        "Logistic Regression": lambda: LogisticRegression(max_iter=3000),
-        "Decision Tree": lambda: DecisionTreeClassifier(max_depth=6, min_samples_leaf=30, random_state=42),
-        "Random Forest": lambda: RandomForestClassifier(n_estimators=200, min_samples_leaf=8, random_state=42, n_jobs=-1),
-        "Gradient Boosting": lambda: GradientBoostingClassifier(random_state=42),
-    }
-    rows, rocs, fitted, probs = [], {}, {}, {}
+    makers = tuned_classifiers()
+    rows, rocs, fitted, preds = [], {}, {}, {}
     for name, make in makers.items():
-        m = make()
-        a, b = (sc.transform(Xtr), sc.transform(Xte)) if name == "Logistic Regression" else (Xtr, Xte)
-        m.fit(a, ytr)
-        p = m.predict_proba(b)[:, 1]
-        yp = (p >= 0.5).astype(int)
+        m = make().fit(Xtr, ytr)
+        p = _score(m, Xte)
+        yp = m.predict(Xte)
         rows.append({"Model": name, "Accuracy": accuracy_score(yte, yp), "Precision": precision_score(yte, yp, zero_division=0),
                      "Recall": recall_score(yte, yp), "F1": f1_score(yte, yp), "ROC AUC": roc_auc_score(yte, p)})
         fpr, tpr, _ = roc_curve(yte, p)
         rocs[name] = (fpr, tpr)
         fitted[name] = m
-        probs[name] = p
-    metrics = pd.DataFrame(rows).sort_values("ROC AUC", ascending=False).reset_index(drop=True)
-    best = metrics.iloc[0]["Model"]
-    cm = confusion_matrix(yte, (probs[best] >= 0.5).astype(int))
+        preds[name] = yp
+    metrics = pd.DataFrame(rows).sort_values(["Accuracy", "ROC AUC"], ascending=False).reset_index(drop=True)
+    best = SELECTED_MODEL
+    cm = confusion_matrix(yte, preds[best])
     fi = pd.Series(fitted["Random Forest"].feature_importances_, index=X.columns).sort_values(ascending=False).head(12)
-    coef = pd.Series(fitted["Logistic Regression"].coef_[0], index=X.columns)
+    lrp = fitted["Logistic Regression"]
+    kept = X.columns[lrp.named_steps["select"].get_support()]
+    coef = pd.Series(lrp.named_steps["m"].coef_[0], index=kept)
+    coef = coef[coef != 0]
     coef = coef.reindex(coef.abs().sort_values(ascending=False).index).head(12)
-    Xall = StandardScaler().fit_transform(X) if best == "Logistic Regression" else X
-    oof = cross_val_predict(makers[best](), Xall, y, cv=StratifiedKFold(5, shuffle=True, random_state=1),
+    oof = cross_val_predict(makers[best](), X, y, cv=StratifiedKFold(5, shuffle=True, random_state=1),
                             method="predict_proba")[:, 1]
-    return {"metrics": metrics, "best": best, "rocs": rocs, "cm": cm, "fi": fi, "coef": coef, "oof": oof}
+    # Model B: the same profile answers plus one reaction to the concept (Q13 concept appeal)
+    XB = X.copy()
+    XB["concept_appeal"] = df["Q13_concept_appeal"].values
+    XBtr, XBte = XB.loc[Xtr.index], XB.loc[Xte.index]
+    mb = Pipeline([("scale", MinMaxScaler()), ("select", SelectKBest(f_classif, k=20)),
+                   ("m", LogisticRegression(solver="saga", l1_ratio=1.0, C=1, max_iter=3000))]).fit(XBtr, ytr)
+    pb = mb.predict(XBte)
+    model_b = {"Accuracy": accuracy_score(yte, pb), "ROC AUC": roc_auc_score(yte, mb.predict_proba(XBte)[:, 1]),
+               "Precision": precision_score(yte, pb), "Recall": recall_score(yte, pb), "cm": confusion_matrix(yte, pb)}
+    return {"metrics": metrics, "best": best, "rocs": rocs, "cm": cm, "fi": fi, "coef": coef, "oof": oof,
+            "model_b": model_b, "n_test": len(yte), "base_rate": float(yte.mean())}
 
 
 # --------------------------------------------------------------------------------------
@@ -270,7 +325,7 @@ def cluster_matrix(df: pd.DataFrame):
     C["spend_per_visit"] = np.log1p(C["spend_per_visit"].clip(lower=0))
     if "Q17_app_download_likelihood" in df:
         C["app_likelihood"] = df["Q17_app_download_likelihood"].values
-    return StandardScaler().fit_transform(C)
+    return RobustScaler().fit_transform(C)   # robust scaling won the 126-solution validity search
 
 
 @st.cache_data(show_spinner="Testing different numbers of segments...")
@@ -281,7 +336,8 @@ def choose_k(df: pd.DataFrame):
     out = []
     for k in range(2, 9):
         km = KMeans(k, n_init=10, random_state=42).fit(Cs)
-        out.append({"k": k, "Inertia": km.inertia_, "Silhouette": silhouette_score(Cs[samp], km.labels_[samp])})
+        out.append({"k": k, "Inertia": km.inertia_, "Silhouette": silhouette_score(Cs[samp], km.labels_[samp]),
+                    "Davies-Bouldin": davies_bouldin_score(Cs, km.labels_), "Calinski-Harabasz": calinski_harabasz_score(Cs, km.labels_)})
     return pd.DataFrame(out)
 
 
@@ -308,6 +364,8 @@ def name_segments(prof: pd.DataFrame, overall: dict) -> dict:
             tags.append("affluent")
         elif r["Price importance (1-5)"] >= overall["price"] + 0.35:
             tags.append("budget-minded")
+        elif r["Price importance (1-5)"] <= overall["price"] - 0.5:
+            tags.append("price-insensitive")
         if r["Share aged 45+"] >= 0.45:
             tags.append("older")
         elif r["Share aged 18-34"] >= 0.65:
@@ -331,14 +389,14 @@ def _rules(fis, n, metric, thr):
 
 
 @st.cache_data(show_spinner="Mining association rules...")
-def run_association(df: pd.DataFrame, min_support: float, min_conf: float, strong_conf: float):
+def run_association(df: pd.DataFrame, min_support: float, min_conf: float, strong_conf: float, min_lift: float = 1.0):
     basket = df.loc[df["interested"] == 1, list(PRODUCTS)].astype(bool)
     basket.columns = [PRODUCTS[c] for c in basket.columns]
     support = basket.mean().sort_values(ascending=False)
     fis = apriori(basket, min_support=min_support, use_colnames=True, max_len=3)
     if fis.empty:
         return support, pd.DataFrame(), pd.DataFrame()
-    rules = _rules(fis, len(basket), "confidence", min_conf)
+    rules = _rules(fis, len(basket), "confidence", min(min_conf, strong_conf))
     rules = rules[(rules["lift"] > 1.0) & (rules["consequents"].apply(len) == 1)].copy()
     rules["If they want"] = rules["antecedents"].apply(lambda s: " + ".join(sorted(s)))
     rules["They also want"] = rules["consequents"].apply(lambda s: next(iter(s)))
@@ -373,7 +431,8 @@ def run_association(df: pd.DataFrame, min_support: float, min_conf: float, stron
                 best = (val, cv, anyc, ld, S)
         sets.append({"Menu size": k, "Wish-list served": best[1], "Get at least one item": best[2],
                      "Let down by a missing pair": best[3], "Items": ", ".join(best[4])})
-    return support, rules, pd.DataFrame(sets)
+    shown = rules[(rules["confidence"] >= min_conf) & (rules["lift"] >= min_lift)]
+    return support, shown, pd.DataFrame(sets)
 
 
 # --------------------------------------------------------------------------------------
@@ -393,10 +452,16 @@ def run_regression(df: pd.DataFrame):
     y = df["Q18_expected_monthly_spend_aed"]
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=42)
     lin = LinearRegression().fit(Xtr, ytr)
-    rf = RandomForestRegressor(n_estimators=200, min_samples_leaf=8, random_state=42, n_jobs=-1).fit(Xtr, ytr)
+    ridge = Pipeline([("sc", StandardScaler()), ("m", Ridge(alpha=300))]).fit(Xtr, ytr)
+    rf = RandomForestRegressor(n_estimators=300, max_depth=12, max_features=0.5, min_samples_leaf=8, random_state=42,
+                               n_jobs=-1).fit(Xtr, ytr)
+    hgb = HistGradientBoostingRegressor(learning_rate=0.05, max_iter=100, max_depth=3, min_samples_leaf=100,
+                                        random_state=42).fit(Xtr, ytr)
+    lasso = Pipeline([("sc", StandardScaler()), ("m", Lasso(alpha=3, max_iter=20000))]).fit(Xtr, ytr)
     rows = []
     preds = {}
-    for name, m in [("Linear Regression", lin), ("Random Forest", rf)]:
+    for name, m in [("Linear Regression", lin), ("Ridge Regression (tuned)", ridge), ("Lasso (tuned)", lasso), ("Random Forest (tuned)", rf),
+                    ("Hist Gradient Boosting (tuned)", hgb)]:
         p = m.predict(Xte)
         preds[name] = p
         rows.append({"Model": name, "R²": r2_score(yte, p), "MAE (AED)": mean_absolute_error(yte, p),
@@ -430,7 +495,8 @@ with st.sidebar.expander("Model settings", expanded=False):
     hi_thr = st.slider("High conversion tier starts at", 0.40, 0.90, 0.60, 0.05)
     lo_thr = st.slider("Low conversion tier ends at", 0.10, 0.50, 0.35, 0.05)
     min_sup = st.slider("Association: minimum support", 0.05, 0.30, 0.08, 0.01)
-    min_conf = st.slider("Association: minimum confidence", 0.40, 0.90, 0.55, 0.05)
+    min_conf = st.slider("Association: minimum confidence", 0.40, 0.90, 0.70, 0.05)
+    min_lift = st.slider("Association: minimum lift", 1.0, 2.0, 1.3, 0.1)
     strong_conf = st.slider("A rule is 'must keep together' above confidence", 0.55, 0.95, 0.65, 0.05)
     target_cover = st.slider("Launch menu should serve at least this much of a wish-list", 60, 95, 80, 5, format="%d%%") / 100
 
@@ -496,7 +562,7 @@ prof["Main barrier"] = prof["Main barrier"].map(BARRIERS).fillna(prof["Main barr
 seg_label = dict(zip(prof["Cluster"], prof["Segment"]))
 df["Segment"] = df["cluster"].map(seg_label)
 
-support, rules, launch = run_association(df, min_sup, min_conf, strong_conf)
+support, rules, launch = run_association(df, min_sup, min_conf, strong_conf, min_lift)
 reg = run_regression(df)
 
 # sustainability maths
@@ -517,9 +583,11 @@ margin = profit / revenue if revenue > 0 else 0
 reach_be = be_day * 30 / visits / conv if visits > 0 and conv > 0 else np.inf
 reach_36 = ((setup / 36 + fixed) / contrib) / visits / conv if contrib > 0 and visits > 0 and conv > 0 else np.inf
 
-best_auc = cls["metrics"].iloc[0]["ROC AUC"]
+_sel = cls["metrics"].set_index("Model").loc[cls["best"]]
+best_auc = _sel["ROC AUC"]
+best_acc = _sel["Accuracy"]
 core = prof.iloc[0]
-targets = prof[prof["Interested"] >= 0.60]
+targets = prof[prof["Interested"] > df["interested"].mean()]
 target_share = targets["Share of sample"].sum()
 target_names = ", ".join(targets["Segment"]) if len(targets) else core["Segment"]
 ok_launch = launch[(launch["Wish-list served"] >= target_cover) & (launch["Let down by a missing pair"] == 0)] if len(launch) else launch
@@ -527,10 +595,12 @@ rec_menu = ok_launch.iloc[0] if len(ok_launch) else (launch.iloc[-1] if len(laun
 checks = [
     ("Enough demand", df["interested"].mean() >= 0.35, f"{pct(df['interested'].mean())} would probably or definitely come (need 35%+)"),
     ("A big enough target market", target_share >= 0.25,
-     f"Segments with 60%+ interest ({target_names}) cover {pct(target_share)} of people (need 25%+)"),
+     f"Segments more interested than average ({target_names}) cover {pct(target_share)} of people (need 25%+)"),
     ("A focused launch menu", rec_menu is not None and rec_menu["Menu size"] <= 7,
      (f"{int(rec_menu['Menu size'])} items serve {pct(rec_menu['Wish-list served'], 0)} of a wish-list (need 7 or fewer)" if rec_menu is not None else "No menu found")),
-    ("Customers can be predicted", best_auc >= 0.75, f"Best model ROC AUC {best_auc:.2f} (need 0.75+)"),
+    ("Customers can be predicted", best_auc >= 0.75,
+     f"Tuned {cls['best'].lower()}: {pct(best_acc)} accuracy, ROC AUC {best_auc:.2f} (need AUC 0.75+); "
+     f"{pct(cls['model_b']['Accuracy'])} with the concept question"),
     ("The money works", payback <= 36, (f"Payback in {payback:.0f} months (need 36 or fewer)" if np.isfinite(payback) else "Loses money at these assumptions")),
 ]
 passed = sum(c[1] for c in checks)
@@ -549,7 +619,7 @@ src = "your uploaded survey" if up is not None else "a synthetic survey"
 st.caption(f"Nanyang kopi bar with butter croissants and kaya toast, JLT Dubai · {src} of {len(raw):,} respondents "
            f"({len(df):,} after cleaning)")
 
-tabs = st.tabs(["Verdict", "Questionnaire", "Data & cleaning", "1 Classification", "2 Clustering",
+tabs = st.tabs(["Verdict", "Questionnaire", "Data & cleaning", "EDA & correlation", "1 Classification", "2 Clustering",
                 "3 Association rules", "4 Regression", "Sustainability"])
 
 # ---- Verdict
@@ -563,7 +633,7 @@ with tabs[0]:
     c = st.columns(5)
     c[0].metric("Would probably or definitely visit", pct(df["interested"].mean()))
     c[1].metric("Likely to become regulars", pct(conv))
-    c[2].metric("Best classifier (ROC AUC)", f"{best_auc:.2f}", cls["best"], delta_color="off")
+    c[2].metric("Selected model accuracy (tuned)", pct(best_acc), cls["best"], delta_color="off")
     c[3].metric("Orders a day vs break-even", f"{orders_day:,.0f}", f"{orders_day - be_day:+,.0f} vs {be_day:,.0f}")
     c[4].metric("Monthly profit", aed(profit), f"payback {payback:.0f} months" if np.isfinite(payback) else "no payback",
                 delta_color="normal" if profit > 0 else "inverse")
@@ -617,26 +687,129 @@ with tabs[2]:
     st.dataframe(raw.head(200), width="stretch", height=300)
     st.download_button("Download cleaned data (CSV)", df.to_csv(index=False).encode(), "kopi_crumb_clean.csv", "text/csv")
 
-# ---- Classification
+# ---- EDA & correlation
 with tabs[3]:
+    st.subheader("Descriptive and diagnostic analytics")
+    st.write("Descriptive statistics summarise what respondents said; the chi-square tests and correlations diagnose "
+             "why some people are interested and others are not.")
+    num = df[["Q8_spend_per_visit_aed", "Q18_expected_monthly_spend_aed", "Q19_max_price_kopi_croissant_combo_aed",
+              "Q21_expected_visits_per_month"]].describe().T.round(1)
+    num.index = ["Spend per visit (AED)", "Expected monthly spend (AED)", "Max combo price (AED)", "Visits per month"]
+    st.dataframe(num, width="stretch")
+    col1, col2 = st.columns(2)
+    sh = df["Q14_visit_intent"].value_counts(normalize=True).reindex(INTENT_ORDER).reset_index()
+    sh.columns = ["Answer", "Share"]
+    f = px.bar(sh, x="Answer", y="Share", text=sh["Share"].map(lambda v: pct(v)), title="Q14: would you visit?",
+               labels={"Answer": ""})
+    f.update_layout(yaxis_tickformat=".0%", height=380)
+    col1.plotly_chart(f, width="stretch")
+    col1.caption("Distribution of the target variable. The top two boxes together give the interest rate used throughout.")
+    inter = df[df["interested"] == 1]
+    dem = inter[list(PRODUCTS)].mean().rename(index=PRODUCTS).sort_values()
+    f = px.bar(x=dem.values, y=dem.index, orientation="h", text=[pct(v, 0) for v in dem.values],
+               title="Q15: what interested people want", labels={"x": "Share", "y": ""})
+    f.update_layout(xaxis_tickformat=".0%", height=380)
+    col2.plotly_chart(f, width="stretch")
+    col2.caption("Breakfast items and kopi lead demand; whole cakes and the pre-order box are niche add-ons.")
+    st.subheader("Correlation matrix (Spearman)")
+    C = pd.DataFrame({
+        "Age": E_all["age"], "Income": E_all["income"], "Café frequency": E_all["cafe_frequency"],
+        "Spend per visit": E_all["spend_per_visit"], "Kopi experience": E_all["kopi_experience"],
+        "Price importance": E_all["price_importance"], "Customisation importance": E_all["customisation_importance"],
+        "Coffee quality importance": E_all["coffee_quality_importance"],
+        "App likelihood": df["Q17_app_download_likelihood"], "Concept appeal": df["Q13_concept_appeal"],
+        "Visit intent": df["Q14_visit_intent"].map(INTENT), "Items wanted": df[list(PRODUCTS)].sum(axis=1),
+        "Visits / month": df["Q21_expected_visits_per_month"], "Monthly spend": df["Q18_expected_monthly_spend_aed"]})
+    corr = C.corr(method="spearman")
+    f = px.imshow(corr, text_auto=".2f", color_continuous_scale=[[0, "#FFFFFF"], [0.5, "#BDBDBD"], [1, "#000000"]], zmin=-1, zmax=1, aspect="auto")
+    f.update_layout(height=620)
+    st.plotly_chart(f, width="stretch")
+    st.caption("Spearman correlation is used because most variables are ordered categories or skewed amounts. "
+               "Visits per month and visit intent move most closely with monthly spend; price importance moves against it.")
+    col1, col2 = st.columns(2)
+    pre = C[["Age", "Income", "Café frequency", "Spend per visit", "Kopi experience", "Price importance",
+             "Customisation importance", "Coffee quality importance", "App likelihood"]]
+    ci = pre.corrwith(df["interested"], method="spearman").sort_values()
+    f = px.bar(x=ci.values, y=ci.index, orientation="h", text=[f"{v:.2f}" for v in ci.values],
+               title="Correlation of each trait with being interested", labels={"x": "Spearman r", "y": ""},
+               color=ci.values > 0, color_discrete_map={True: COFFEE[2], False: BAD})
+    f.update_layout(showlegend=False, height=400)
+    col1.plotly_chart(f, width="stretch")
+    rows = []
+    for col in ["Q7_cafe_visit_frequency", "Q11_kopi_experience", "Q1_age_group", "Q4_household_income_aed_month",
+                "Q3_occupation", "Q5_area"]:
+        if col in df:
+            t = pd.crosstab(df[col], df["interested"])
+            chi2, p, dof, _ = chi2_contingency(t)
+            rows.append({"Variable": col.split("_", 1)[1].replace("_", " ").capitalize(), "Chi-square": chi2, "df": dof,
+                         "p-value": p, "Cramér's V": np.sqrt(chi2 / (t.values.sum() * (min(t.shape) - 1))),
+                         "Significant (p < 0.05)": "Yes" if p < 0.05 else "No"})
+    col2.write("**Chi-square tests: is interest linked to each characteristic?**")
+    col2.dataframe(pd.DataFrame(rows).style.format({"Chi-square": "{:.1f}", "p-value": "{:.2g}", "Cramér's V": "{:.3f}"}),
+                   hide_index=True, width="stretch")
+    col2.caption("Café frequency has the strongest link with interest. Area is not significant, so location should be "
+                 "chosen on rent and footfall rather than on where interest is highest.")
+
+# ---- Classification
+with tabs[4]:
     st.subheader("Will they come? Predicting Q14 interest")
     st.write("Target: 'Probably yes' or 'Definitely yes' on Q14. The models only use answers we would know before showing "
-             "the concept (Q1 to Q12), so the same model can score new prospects. 25% of people are held back for testing.")
+             "the concept (Q1 to Q12), so the same model can score new prospects. 25% of people are held back for testing. "
+             "Every model below uses the best settings found by hyperparameter tuning.")
     m = cls["metrics"].copy()
     st.dataframe(m.style.format({"Accuracy": "{:.1%}", "Precision": "{:.1%}", "Recall": "{:.1%}", "F1": "{:.3f}",
-                                 "ROC AUC": "{:.3f}"}).highlight_max(subset=["ROC AUC"], color="#E8D9C5"),
+                                 "ROC AUC": "{:.3f}"}).highlight_max(subset=["Accuracy"], color="#E8D9C5"),
                  hide_index=True, width="stretch")
+
+    st.subheader("Hyperparameter tuning")
+    st.write(f"**{TUNING_TOTAL['configurations']:,} configurations and {TUNING_TOTAL['fits']:,} model fits.** Exhaustive grids "
+             "(randomised search for random forest and gradient boosting) covered scaling method, feature selection, "
+             "regularisation, class weighting and each model's own settings, all scored by 5-fold cross-validated accuracy on "
+             "the training data only, with scaling and feature selection inside the pipeline. Finalists were re-ranked with "
+             "repeated cross-validation (5 folds x 3 repeats); the test set was used once. The decision threshold was tuned "
+             f"too and stayed at {BEST_THRESHOLD:.2f}.")
+    col1, col2 = st.columns([3, 2])
+    long = TUNING.melt(id_vars="Model", value_vars=["CV accuracy (default)", "CV accuracy (tuned)"], var_name="Stage",
+                       value_name="Accuracy").dropna()
+    long["Stage"] = long["Stage"].map({"CV accuracy (default)": "Default settings", "CV accuracy (tuned)": "Tuned"})
+    f = px.bar(long, x="Accuracy", y="Model", color="Stage", barmode="group", orientation="h",
+               text=long["Accuracy"].map(lambda v: pct(v)), color_discrete_map={"Default settings": "#BBBBBB", "Tuned": COFFEE[0]},
+               title="Cross-validated accuracy before and after tuning (training data)")
+    f.add_vline(x=ACCURACY_CEILING, line_dash="dash", line_color="#444444",
+                annotation_text=f"Ceiling {pct(ACCURACY_CEILING)}", annotation_position="top")
+    f.update_layout(xaxis_tickformat=".0%", xaxis_range=[0.55, 0.85], height=480, yaxis={"autorange": "reversed"},
+                    legend_title_text="", legend={"orientation": "h", "y": -0.18})
+    col1.plotly_chart(f, width="stretch")
+    sel = m.set_index("Model").loc[SELECTED_MODEL]
+    col2.write(f"**Selected model: tuned {SELECTED_MODEL.lower()}**")
+    col2.write("Highest repeated cross-validation accuracy, no gap between training and validation accuracy, and the "
+               "easiest model to explain. Every tuned model sits within about 1.5 points of it on the test set.")
+    a1, a2 = col2.columns(2)
+    a1.metric("Test accuracy", pct(sel["Accuracy"]))
+    a2.metric("ROC AUC", f"{sel['ROC AUC']:.3f}")
+    mb = cls["model_b"]
+    col2.write("**Model B: add one concept question (Q13)**")
+    b1, b2 = col2.columns(2)
+    b1.metric("Test accuracy", pct(mb["Accuracy"]), f"{(mb['Accuracy'] - sel['Accuracy']) * 100:+.1f} pts")
+    b2.metric("Precision", pct(mb["Precision"]))
+    st.dataframe(TUNING.style.format({"CV accuracy (default)": "{:.1%}", "CV accuracy (tuned)": "{:.1%}",
+                                      "Repeated CV accuracy": "{:.1%}", "Test accuracy (default)": "{:.1%}",
+                                      "Configurations": "{:,.0f}", "Fits": "{:,.0f}"}, na_rep="-"),
+                 hide_index=True, width="stretch")
+    st.caption(f"The ceiling ({pct(ACCURACY_CEILING)}) is what a model would score if it knew every hidden trait used to "
+               "simulate each respondent. Profile answers reveal only part of those traits, so profile-only models stop near "
+               "74%. Model B adds a reaction to the concept and reaches the ceiling.")
     col1, col2 = st.columns(2)
     f = go.Figure()
     for i, (name, (fpr, tpr)) in enumerate(cls["rocs"].items()):
-        f.add_trace(go.Scatter(x=fpr, y=tpr, name=name, line={"color": COFFEE[i], "width": 3 if name == cls["best"] else 1.5}))
+        f.add_trace(go.Scatter(x=fpr, y=tpr, name=name.replace(" (LR + HGB + GB)", ""), line={"color": COFFEE[i % len(COFFEE)], "width": 3 if name == cls["best"] else 1.2}))
     f.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Random guess", line={"dash": "dash", "color": "#999"}))
     f.update_layout(title="ROC curves", xaxis_title="False positive rate", yaxis_title="True positive rate", height=420)
     col1.plotly_chart(f, width="stretch")
     cm = cls["cm"]
     f = px.imshow(cm, text_auto=True, color_continuous_scale=["#FFF8F0", "#6F4E37"],
                   x=["Predicted not interested", "Predicted interested"], y=["Not interested", "Interested"],
-                  title=f"Confusion matrix: {cls['best']}")
+                  title=f"Confusion matrix: {cls['best']} (selected model)")
     f.update_layout(height=420, coloraxis_showscale=False)
     col2.plotly_chart(f, width="stretch")
     col1, col2 = st.columns(2)
@@ -668,21 +841,21 @@ with tabs[3]:
     st.plotly_chart(f, width="stretch")
 
 # ---- Clustering
-with tabs[4]:
+with tabs[5]:
     st.subheader("Who should we target? K-means segments")
     st.write(f"K-means on age, income, household size, café habits, spend, kopi experience, the seven Q12 ratings and app "
-             f"likelihood (all standardised). Showing **k = {k_choice}**; change it in the sidebar.")
-    col1, col2 = st.columns(2)
-    f = px.line(k_table, x="k", y="Inertia", markers=True, title="Elbow method")
-    f.add_vline(x=k_choice, line_dash="dash", line_color=COFFEE[1])
-    f.update_layout(height=320)
-    col1.plotly_chart(f, width="stretch")
-    f = px.line(k_table, x="k", y="Silhouette", markers=True, title="Silhouette score (higher = better separated)")
-    f.add_vline(x=k_choice, line_dash="dash", line_color=COFFEE[1])
-    f.update_layout(height=320)
-    col2.plotly_chart(f, width="stretch")
-    st.caption("Silhouette scores below 0.2 are normal for survey ratings: people blend into each other. "
-               "Pick k where the segments are easy to describe and act on.")
+             f"likelihood, with **robust scaling**. {CLUSTER_SEARCH} solutions (3 scalers x 6 algorithms x k = 2 to 8) were "
+             f"compared on three validity measures; robust-scaled k-means led them. Showing **k = {k_choice}**; change it in the sidebar.")
+    cols = st.columns(3)
+    for col, (met, note) in zip(cols, [("Silhouette", "higher is better"), ("Davies-Bouldin", "lower is better"),
+                                       ("Calinski-Harabasz", "higher is better")]):
+        f = px.line(k_table, x="k", y=met, markers=True, title=f"{met} ({note})")
+        f.add_vline(x=k_choice, line_dash="dash", line_color=COFFEE[1])
+        f.update_layout(height=300)
+        col.plotly_chart(f, width="stretch")
+    st.caption("k = 3 scores best on all three measures. k = 4 is kept because it beats the original standard-scaled "
+               "4-segment solution on all three and splits frequent café-goers by price sensitivity, which the pricing plan "
+               "needs. Scores this low are normal for survey ratings.")
     show = prof.drop(columns=["Cluster"])
     st.dataframe(show.style.format({"Share of sample": "{:.1%}", "Interested": "{:.1%}", "High tier": "{:.1%}",
                                     "Median spend / month (AED)": "{:,.0f}", "Visits / month": "{:.1f}",
@@ -711,7 +884,7 @@ with tabs[4]:
                  width="stretch")
 
 # ---- Association
-with tabs[5]:
+with tabs[6]:
     st.subheader("What should we launch first? Association rules on Q15")
     st.write("Apriori on the wish-lists of interested respondents. For every menu size, every combination is tested to find "
              "the one that serves the most of each person's wish-list without breaking a 'must keep together' rule "
@@ -749,7 +922,9 @@ with tabs[5]:
         st.dataframe(top.rename(columns={"support": "Support", "confidence": "Confidence", "lift": "Lift"})
                      .style.format({"Support": "{:.1%}", "Confidence": "{:.1%}", "Lift": "{:.2f}"}),
                      hide_index=True, width="stretch", height=420)
-        st.caption(f"{len(rules):,} rules found. Support = share of interested people who want all the items. "
+        st.caption(f"{len(rules):,} rules at the validated thresholds (support 8%, confidence 70%, lift 1.3, chosen from "
+                   f"{RULE_THRESHOLDS_TESTED} threshold combinations because every rule kept its lift above 1 on unseen baskets). "
+                   "Support = share of interested people who want all the items. "
                    "Confidence = of those who want the left side, the share who also want the right side. "
                    "Lift above 1 = they go together more than by chance.")
         svc = rules[rules["They also want"].isin(SERVICES) & (rules["antecedents"].apply(len) == 1)].head(6)
@@ -760,12 +935,18 @@ with tabs[5]:
                          .style.format({"Confidence": "{:.1%}", "Lift": "{:.2f}"}), hide_index=True, width="stretch")
 
 # ---- Regression
-with tabs[6]:
+with tabs[7]:
     st.subheader("How much will they spend? Predicting Q18 monthly spend")
     st.write("Inputs: profile answers plus concept appeal (Q13), visit intent (Q14), app likelihood (Q17), "
              "number of items wanted (Q15) and bulk-order intent (Q20).")
-    st.dataframe(reg["metrics"].style.format({"R²": "{:.3f}", "MAE (AED)": "{:,.1f}", "RMSE (AED)": "{:,.1f}"}),
-                 hide_index=True, width="stretch")
+    st.dataframe(reg["metrics"].style.format({"R²": "{:.3f}", "MAE (AED)": "{:,.1f}", "RMSE (AED)": "{:,.1f}"})
+                 .highlight_max(subset=["R²"], color="#E8D9C5"), hide_index=True, width="stretch")
+    with st.expander("Hyperparameter tuning for the spend models"):
+        st.dataframe(REG_TUNING.style.format({"Test R² (default)": "{:.3f}", "CV R² (tuned)": "{:.3f}", "Training R² (tuned)": "{:.3f}"}),
+                     hide_index=True, width="stretch")
+        st.caption(f"{REG_TOTAL['configurations']} configurations and {REG_TOTAL['fits']} fits, scored by 5-fold cross-validated R² "
+                   "on the training data. Gradient boosting is used for predictions: its CV R² is within 0.01 of the random "
+                   "forest, but its training-validation gap is much smaller, so it is the more stable choice.")
     col1, col2 = st.columns(2)
     best_reg = reg["metrics"].sort_values("R²", ascending=False).iloc[0]["Model"]
     ap = pd.DataFrame({"Actual": reg["yte"], "Predicted": reg["preds"][best_reg]})
@@ -788,7 +969,7 @@ with tabs[6]:
     st.plotly_chart(f, width="stretch")
 
 # ---- Sustainability
-with tabs[7]:
+with tabs[8]:
     st.subheader("Does the money work?")
     st.markdown(f"<div style='font-size:1.4rem;font-weight:600;color:{vcol}'>{verdict}</div>", unsafe_allow_html=True)
     c = st.columns(4)
